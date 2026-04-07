@@ -1,0 +1,25 @@
+{
+  "name": "fufuni-merchant",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "echo 'No build step required'",
+    "db:init": "wrangler d1 execute DB --local --file=./migrations/001-init.sql",
+    "db:seed": "npx tsx scripts/seed.ts"
+  },
+  "dependencies": {
+    "hono": "^4.12.9",
+    "@hono/zod-openapi": "^1.2.4",
+    "@hono/swagger-ui": "^0.6.1",
+    "zod": "^3.23.8",
+    "jose": "^6.2.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260317.1",
+    "wrangler": "^4.80.0",
+    "tsx": "^4.21.0",
+    "@types/node": "^22.0.0"
+  }
+}

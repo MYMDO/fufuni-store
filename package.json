@@ -1,0 +1,38 @@
+{
+  "name": "fufuni-store",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Повністю безкоштовний Serverless інтернет-магазин на Cloudflare Workers & Pages",
+  "workspaces": [
+    "apps/merchant",
+    "apps/client",
+    "scripts"
+  ],
+  "scripts": {
+    "install:all": "npm install && npm install -w apps/merchant -w apps/client -w scripts",
+    "dev": "npm run dev --workspace=apps/merchant",
+    "dev:client": "npm run dev --workspace=apps/client",
+    "deploy": "npm run deploy --workspace=apps/merchant",
+    "build": "npm run build --workspace=apps/client",
+    "build:all": "npm run build",
+    "seed": "node scripts/seed.js"
+  },
+  "keywords": [
+    "ecommerce",
+    "cloudflare",
+    "workers",
+    "serverless",
+    "store",
+    "shop",
+    "ukraine"
+  ],
+  "author": "",
+  "license": "CC0-1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MYMDO/fufuni-store"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

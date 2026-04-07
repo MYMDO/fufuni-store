@@ -1,0 +1,45 @@
+{
+  "$schema": "wrangler.toml.schema.json",
+  "name": "fufuni-merchant",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "MERCHANT_DO", "class_name": "MerchantDO" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MerchantDO"] }
+  ],
+
+  "r2_buckets": [
+    { "binding": "IMAGES", "bucket_name": "fufuni-images" }
+  ],
+
+  "kv_namespaces": [
+    { "binding": "KV_CACHE", "id": "${KV_CACHE_ID}" }
+  ],
+
+  "vars": {
+    "MERCHANT_PK": "",
+    "MERCHANT_SK": "",
+    "STORE_NAME": "Fufuni Store",
+    "STORE_URL": "",
+    "IMAGES_URL": "",
+    "CORS_ORIGIN": "*",
+    "API_BASE_URL": "",
+    "STRIPE_PUBLISHABLE_KEY": "",
+    "KV_CACHE_ID": ""
+  },
+
+  "triggers": {
+    "crons": ["15 * * * *"]
+  },
+
+  "dev": {
+    "port": 8787,
+    "local_protocol": "http"
+  }
+}
