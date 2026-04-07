@@ -2,34 +2,64 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import type { Env } from '../types';
-import { getDO } from '../lib/helpers';
+import { generateId, initDatabase } from '../lib/db';
 
 export const cartRoutes = new Hono<{ Bindings: Env }>();
 
+let dbInitialized = false;
+
+async function ensureDb(c: any) {
+  if (!dbInitialized) {
+    await initDatabase(c.env.DB);
+    dbInitialized = true;
+  }
+}
+
 // Get cart
 cartRoutes.get('/cart/:id', async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM carts WHERE id = ?')
+    .bind(id)
+    .first();
   
-  const cart = await doStub.getCart(id);
-  
-  if (!cart) {
+  if (!result) {
     return c.json({ error: 'Cart not found' }, 404);
   }
   
-  return c.json(cart);
+  return c.json({
+    id: result.id,
+    items: JSON.parse(result.items || '[]'),
+    subtotal: result.subtotal,
+    currency: result.currency,
+    createdAt: result.created_at,
+    updatedAt: result.updated_at
+  });
 });
 
-// Create new cart
+// Create cart
 cartRoutes.post('/cart', async (c) => {
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  await ensureDb(c);
   
-  const cart = await doStub.createCart();
+  const id = generateId();
+  const now = Date.now();
   
-  return c.json(cart, 201);
+  await c.env.DB
+    .prepare(`INSERT INTO carts (id, items, subtotal, currency, created_at, updated_at) VALUES (?, '[]', 0, 'UAH', ?, ?)`)
+    .bind(id, now, now)
+    .run();
+  
+  return c.json({
+    id,
+    items: [],
+    subtotal: 0,
+    currency: 'UAH',
+    createdAt: now,
+    updatedAt: now
+  }, 201);
 });
 
 // Add item to cart
@@ -40,19 +70,80 @@ const addToCartSchema = z.object({
 });
 
 cartRoutes.post('/cart/:id/items', zValidator('json', addToCartSchema), async (c) => {
-  const id = c.req.param('id');
-  const data = c.req.valid('json');
+  await ensureDb(c);
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const cartId = c.req.param('id');
+  const { productId, variantId, quantity } = c.req.valid('json');
   
-  const cart = await doStub.addToCart(id, data);
+  // Get or create cart
+  let cart = await c.env.DB
+    .prepare('SELECT * FROM carts WHERE id = ?')
+    .bind(cartId)
+    .first();
   
   if (!cart) {
-    return c.json({ error: 'Cart not found or invalid product/variant' }, 400);
+    const newId = generateId();
+    const now = Date.now();
+    await c.env.DB
+      .prepare(`INSERT INTO carts (id, items, subtotal, currency, created_at, updated_at) VALUES (?, '[]', 0, 'UAH', ?, ?)`)
+      .bind(newId, now, now)
+      .run();
+    cart = { id: newId, items: '[]', subtotal: 0 };
   }
   
-  return c.json(cart);
+  // Get product and variant
+  const product = await c.env.DB
+    .prepare('SELECT * FROM products WHERE id = ?')
+    .bind(productId)
+    .first();
+  
+  if (!product) {
+    return c.json({ error: 'Product not found' }, 404);
+  }
+  
+  const variant = await c.env.DB
+    .prepare('SELECT * FROM variants WHERE id = ? AND product_id = ?')
+    .bind(variantId, productId)
+    .first();
+  
+  if (!variant) {
+    return c.json({ error: 'Variant not found' }, 404);
+  }
+  
+  // Add to cart
+  let items = JSON.parse(cart.items as string || '[]');
+  const existingIndex = items.findIndex((i: any) => i.variantId === variantId);
+  
+  if (existingIndex >= 0) {
+    items[existingIndex].quantity += quantity;
+  } else {
+    items.push({
+      id: generateId(),
+      productId,
+      variantId,
+      quantity,
+      price: variant.price,
+      title: product.title,
+      sku: variant.sku,
+      image: JSON.parse(product.images as string || '[]')[0]
+    });
+  }
+  
+  const subtotal = items.reduce((sum: number, i: any) => sum + (i.price * i.quantity), 0);
+  const now = Date.now();
+  
+  await c.env.DB
+    .prepare('UPDATE carts SET items = ?, subtotal = ?, updated_at = ? WHERE id = ?')
+    .bind(JSON.stringify(items), subtotal, now, cartId)
+    .run();
+  
+  return c.json({
+    id: cartId,
+    items,
+    subtotal,
+    currency: 'UAH',
+    updatedAt: now
+  });
 });
 
 // Update cart item quantity
@@ -61,89 +152,90 @@ const updateCartItemSchema = z.object({
 });
 
 cartRoutes.patch('/cart/:cartId/items/:itemId', zValidator('json', updateCartItemSchema), async (c) => {
-  const cartId = c.req.param('cartId');
-  const itemId = c.req.param('itemId');
+  await ensureDb(c);
+  
+  const { cartId, itemId } = c.req.param();
   const { quantity } = c.req.valid('json');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const cart = await doStub.updateCartItem(cartId, itemId, quantity);
+  const cart = await c.env.DB
+    .prepare('SELECT * FROM carts WHERE id = ?')
+    .bind(cartId)
+    .first();
   
   if (!cart) {
     return c.json({ error: 'Cart not found' }, 404);
   }
   
-  return c.json(cart);
+  let items = JSON.parse(cart.items as string || '[]');
+  const index = items.findIndex((i: any) => i.id === itemId);
+  
+  if (index < 0) {
+    return c.json({ error: 'Item not found' }, 404);
+  }
+  
+  if (quantity <= 0) {
+    items.splice(index, 1);
+  } else {
+    items[index].quantity = quantity;
+  }
+  
+  const subtotal = items.reduce((sum: number, i: any) => sum + (i.price * i.quantity), 0);
+  const now = Date.now();
+  
+  await c.env.DB
+    .prepare('UPDATE carts SET items = ?, subtotal = ?, updated_at = ? WHERE id = ?')
+    .bind(JSON.stringify(items), subtotal, now, cartId)
+    .run();
+  
+  return c.json({
+    id: cartId,
+    items,
+    subtotal,
+    currency: 'UAH'
+  });
 });
 
 // Remove item from cart
 cartRoutes.delete('/cart/:cartId/items/:itemId', async (c) => {
-  const cartId = c.req.param('cartId');
-  const itemId = c.req.param('itemId');
+  const { cartId, itemId } = c.req.param();
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const cart = await c.env.DB
+    .prepare('SELECT * FROM carts WHERE id = ?')
+    .bind(cartId)
+    .first();
   
-  const cart = await doStub.removeFromCart(cartId, itemId);
-  
-  return c.json(cart);
-});
-
-// Clear cart
-cartRoutes.delete('/cart/:id', async (c) => {
-  const id = c.req.param('id');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const cart = await doStub.clearCart(id);
-  
-  return c.json(cart);
-});
-
-// Apply discount
-cartRoutes.post('/cart/:id/discount', async (c) => {
-  const id = c.req.param('id');
-  const { code } = await c.req.json<{ code: string }>();
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const cart = await doStub.getCart(id);
   if (!cart) {
     return c.json({ error: 'Cart not found' }, 404);
   }
   
-  const discount = await doStub.getDiscount(code.toUpperCase());
-  if (!discount) {
-    return c.json({ error: 'Invalid or expired discount code' }, 400);
-  }
+  let items = JSON.parse(cart.items as string || '[]').filter((i: any) => i.id !== itemId);
+  const subtotal = items.reduce((sum: number, i: any) => sum + (i.price * i.quantity), 0);
+  const now = Date.now();
   
-  if (discount.minPurchase && cart.subtotal < discount.minPurchase) {
-    return c.json({ 
-      error: `Minimum purchase of ${discount.minPurchase / 100} required for this discount` 
-    }, 400);
-  }
-  
-  let discountAmount = 0;
-  if (discount.type === 'percentage') {
-    discountAmount = Math.round(cart.subtotal * (discount.value / 100));
-  } else {
-    discountAmount = discount.value;
-  }
+  await c.env.DB
+    .prepare('UPDATE carts SET items = ?, subtotal = ?, updated_at = ? WHERE id = ?')
+    .bind(JSON.stringify(items), subtotal, now, cartId)
+    .run();
   
   return c.json({
-    discount: {
-      code: discount.code,
-      type: discount.type,
-      value: discount.value,
-      amount: discountAmount
-    },
-    cart: {
-      ...cart,
-      discount: discountAmount,
-      total: cart.subtotal - discountAmount
-    }
+    id: cartId,
+    items,
+    subtotal,
+    currency: 'UAH'
   });
+});
+
+// Clear cart
+cartRoutes.delete('/cart/:id', async (c) => {
+  await ensureDb(c);
+  
+  const id = c.req.param('id');
+  const now = Date.now();
+  
+  await c.env.DB
+    .prepare('UPDATE carts SET items = ?, subtotal = ?, updated_at = ? WHERE id = ?')
+    .bind('[]', 0, now, id)
+    .run();
+  
+  return c.json({ id, items: [], subtotal: 0, currency: 'UAH' });
 });

@@ -1,10 +1,19 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
-import type { Env, CustomerInfo, Address } from '../types';
-import { getDO } from '../lib/helpers';
+import type { Env } from '../types';
+import { generateId, generateOrderNumber, initDatabase } from '../lib/db';
 
 export const checkoutRoutes = new Hono<{ Bindings: Env }>();
+
+let dbInitialized = false;
+
+async function ensureDb(c: any) {
+  if (!dbInitialized) {
+    await initDatabase(c.env.DB);
+    dbInitialized = true;
+  }
+}
 
 const checkoutSchema = z.object({
   cartId: z.string(),
@@ -16,206 +25,106 @@ const checkoutSchema = z.object({
   }),
   shippingAddress: z.object({
     line1: z.string(),
-    line2: z.string().optional(),
     city: z.string(),
-    state: z.string().optional(),
-    postalCode: z.string(),
-    country: z.string().length(2)
-  }).optional(),
-  shippingMethod: z.object({
-    id: z.string().optional(),
-    name: z.string(),
-    price: z.number().int()
-  }).optional(),
-  notes: z.string().optional(),
-  discountCode: z.string().optional()
+    postalCode: z.string()
+  }).optional()
 });
 
 checkoutRoutes.post('/checkout', zValidator('json', checkoutSchema), async (c) => {
+  await ensureDb(c);
+  
   const data = c.req.valid('json');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
   // Get cart
-  const cart = await doStub.getCart(data.cartId);
+  const cart = await c.env.DB
+    .prepare('SELECT * FROM carts WHERE id = ?')
+    .bind(data.cartId)
+    .first();
+  
   if (!cart) {
     return c.json({ error: 'Cart not found' }, 404);
   }
   
-  if (cart.items.length === 0) {
+  const items = JSON.parse(cart.items as string || '[]');
+  
+  if (items.length === 0) {
     return c.json({ error: 'Cart is empty' }, 400);
   }
   
-  // Get store config for tax
-  const config = await doStub.getConfig();
-  
-  // Calculate totals
-  const subtotal = cart.subtotal;
-  let discountAmount = 0;
-  
-  // Apply discount if provided
-  if (data.discountCode) {
-    const discount = await doStub.getDiscount(data.discountCode.toUpperCase());
-    if (discount) {
-      if (discount.minPurchase && subtotal < discount.minPurchase) {
-        return c.json({ 
-          error: `Minimum purchase of ${discount.minPurchase / 100} required` 
-        }, 400);
-      }
-      
-      if (discount.type === 'percentage') {
-        discountAmount = Math.round(subtotal * (discount.value / 100));
-      } else {
-        discountAmount = discount.value;
-      }
-    }
-  }
-  
-  const afterDiscount = subtotal - discountAmount;
-  
-  // Calculate shipping
-  let shipping = data.shippingMethod?.price || 0;
-  if (config.shipping.enabled && config.shipping.freeThreshold && afterDiscount >= config.shipping.freeThreshold) {
-    shipping = 0;
-  }
-  
-  // Calculate tax
-  let tax = 0;
-  if (config.tax.enabled && !config.tax.included) {
-    tax = Math.round(afterDiscount * (config.tax.rate / 100));
-  }
-  
-  const total = afterDiscount + shipping + tax;
-  
   // Create order
-  const order = await doStub.createOrder({
-    items: cart.items,
-    subtotal: afterDiscount,
-    shipping,
-    tax,
-    total,
-    customer: data.customer,
-    shippingAddress: data.shippingAddress,
-    stripeSessionId: undefined // Will be updated after Stripe redirect
-  });
+  const id = generateId();
+  const number = generateOrderNumber();
+  const now = Date.now();
+  const subtotal = cart.subtotal as number;
+  const shipping = 0;
+  const tax = 0;
+  const total = subtotal + shipping + tax;
+  
+  await c.env.DB
+    .prepare(`INSERT INTO orders (id, number, status, items, subtotal, shipping, tax, total, currency, customer, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 'UAH', ?, ?, ?)`)
+    .bind(id, number, JSON.stringify(items), subtotal, shipping, tax, total, JSON.stringify(data.customer), now, now)
+    .run();
   
   // Clear cart
-  await doStub.clearCart(data.cartId);
-  
-  // In production, create Stripe Checkout session here
-  // For now, return order details
-  const checkoutUrl = `${c.env.STORE_URL || 'https://your-store.com'}/checkout/${order!.id}?session_id=demo_${order!.id}`;
+  await c.env.DB
+    .prepare('UPDATE carts SET items = ?, subtotal = ?, updated_at = ? WHERE id = ?')
+    .bind('[]', 0, now, data.cartId)
+    .run();
   
   return c.json({
-    order,
-    checkoutUrl,
-    paymentRequired: total > 0,
-    demo: true,
-    message: 'This is a demo checkout. In production, Stripe Checkout would redirect here.'
-  });
+    order: {
+      id,
+      number,
+      status: 'pending',
+      items,
+      subtotal,
+      shipping,
+      tax,
+      total,
+      currency: 'UAH',
+      customer: data.customer
+    },
+    message: 'Order created successfully'
+  }, 201);
 });
 
-// Get checkout session (for Stripe redirect)
-checkoutRoutes.get('/checkout/session/:sessionId', async (c) => {
-  const sessionId = c.req.param('sessionId');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  // In production, verify Stripe session
-  // For demo, extract order ID from session
-  const orderId = sessionId.replace('demo_', '');
-  
-  const order = await doStub.getOrder(orderId);
-  
-  if (!order) {
-    return c.json({ error: 'Order not found' }, 404);
-  }
-  
-  return c.json(order);
-});
-
-// Get available shipping rates
-checkoutRoutes.get('/checkout/shipping-rates', async (c) => {
-  const country = c.req.query('country');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const config = await doStub.getConfig();
-  
-  if (!config.shipping.enabled) {
-    return c.json({ rates: [] });
-  }
-  
-  let rates = config.shipping.rates || [];
-  
-  // Filter by country if specified
-  if (country) {
-    rates = rates.filter(r => 
-      !r.countries || 
-      r.countries.length === 0 || 
-      r.countries.includes(country)
-    );
-  }
-  
-  return c.json({ 
-    rates: rates.map(r => ({
-      id: r.id,
-      name: r.name,
-      price: r.price,
-      estimatedDays: r.estimatedDays,
-      currency: r.currency || config.currency
-    })),
-    freeThreshold: config.shipping.freeThreshold
-  });
-});
-
-// Order confirmation (public)
+// Get order
 checkoutRoutes.get('/orders/:id', async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM orders WHERE id = ?')
+    .bind(id)
+    .first();
   
-  const order = await doStub.getOrder(id);
-  
-  if (!order) {
+  if (!result) {
     return c.json({ error: 'Order not found' }, 404);
   }
   
-  // Don't expose sensitive data
   return c.json({
-    id: order.id,
-    number: order.number,
-    status: order.status,
-    total: order.total,
-    currency: order.currency,
-    items: order.items,
-    createdAt: order.createdAt
+    id: result.id,
+    number: result.number,
+    status: result.status,
+    items: JSON.parse(result.items || '[]'),
+    subtotal: result.subtotal,
+    shipping: result.shipping,
+    tax: result.tax,
+    total: result.total,
+    currency: result.currency,
+    customer: JSON.parse(result.customer || '{}'),
+    createdAt: result.created_at
   });
 });
 
-// Order lookup by number
-checkoutRoutes.get('/orders/number/:number', async (c) => {
-  const number = c.req.param('number');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const order = await doStub.getOrderByNumber(number);
-  
-  if (!order) {
-    return c.json({ error: 'Order not found' }, 404);
-  }
-  
+// Get shipping rates
+checkoutRoutes.get('/checkout/shipping-rates', async (c) => {
   return c.json({
-    id: order.id,
-    number: order.number,
-    status: order.status,
-    total: order.total,
-    currency: order.currency,
-    createdAt: order.createdAt
+    rates: [
+      { id: 'standard', name: 'Стандартна доставка', price: 0, estimatedDays: 5 },
+      { id: 'express', name: 'Експрес доставка', price: 5000, estimatedDays: 2 }
+    ],
+    freeThreshold: 50000
   });
 });

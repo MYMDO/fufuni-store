@@ -1,236 +1,271 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
-import type { Env, Product } from '../types';
-import { getDO, requireAuth, validatePublicKey } from '../lib/helpers';
+import type { Env } from '../types';
+import { generateId, generateSku, initDatabase } from '../lib/db';
 
 export const catalogRoutes = new Hono<{ Bindings: Env }>();
 
+// Initialize database on first request
+let dbInitialized = false;
+
+async function ensureDb(c: any) {
+  if (!dbInitialized) {
+    await initDatabase(c.env.DB);
+    dbInitialized = true;
+  }
+}
+
 // Get all products
-catalogRoutes.get('/products', validatePublicKey, async (c) => {
+catalogRoutes.get('/products', async (c) => {
+  await ensureDb(c);
+  
   const status = c.req.query('status') || 'active';
-  const categoryId = c.req.query('categoryId') || undefined;
   const limit = parseInt(c.req.query('limit') || '50');
-  const cursor = c.req.query('cursor') || undefined;
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM products WHERE status = ? ORDER BY created_at DESC LIMIT ?')
+    .bind(status, limit)
+    .all();
   
-  const result = await doStub.getProducts({ status, categoryId, limit, cursor });
+  const products = [];
+  for (const row of result.results || []) {
+    const variants = await c.env.DB
+      .prepare('SELECT * FROM variants WHERE product_id = ?')
+      .bind(row.id)
+      .all();
+    
+    products.push({
+      id: row.id,
+      title: row.title,
+      description: row.description,
+      price: row.price,
+      currency: row.currency,
+      images: JSON.parse(row.images || '[]'),
+      categoryId: row.category_id,
+      status: row.status,
+      variants: (variants.results || []).map((v: any) => ({
+        id: v.id,
+        sku: v.sku,
+        title: v.title,
+        price: v.price,
+        compareAtPrice: v.compare_at_price,
+        currency: v.currency,
+        stock: v.stock,
+        options: JSON.parse(v.options || '{}')
+      })),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    });
+  }
   
-  return c.json({
-    products: result.products,
-    nextCursor: result.nextCursor,
-    total: result.products.length
-  });
+  return c.json({ products, total: products.length });
 });
 
 // Search products
-catalogRoutes.get('/products/search', validatePublicKey, async (c) => {
+catalogRoutes.get('/products/search', async (c) => {
+  await ensureDb(c);
+  
   const q = c.req.query('q')?.toLowerCase() || '';
   const limit = parseInt(c.req.query('limit') || '20');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM products WHERE status = ? AND (title LIKE ? OR description LIKE ?) LIMIT ?')
+    .bind('active', `%${q}%`, `%${q}%`, limit)
+    .all();
   
-  const { products } = await doStub.getProducts({ status: 'active', limit: 100 });
+  const products = (result.results || []).map((row: any) => ({
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    price: row.price,
+    currency: row.currency,
+    images: JSON.parse(row.images || '[]'),
+    categoryId: row.category_id,
+    status: row.status
+  }));
   
-  const filtered = products.filter(p => 
-    p.title.toLowerCase().includes(q) ||
-    p.description?.toLowerCase().includes(q) ||
-    p.variants?.some(v => v.sku.toLowerCase().includes(q))
-  ).slice(0, limit);
-  
-  return c.json({ products: filtered, total: filtered.length });
+  return c.json({ products, total: products.length });
 });
 
 // Get single product
-catalogRoutes.get('/products/:id', validatePublicKey, async (c) => {
+catalogRoutes.get('/products/:id', async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM products WHERE id = ?')
+    .bind(id)
+    .first();
   
-  const product = await doStub.getProduct(id);
-  
-  if (!product) {
+  if (!result) {
     return c.json({ error: 'Product not found' }, 404);
   }
   
-  return c.json(product);
+  const variants = await c.env.DB
+    .prepare('SELECT * FROM variants WHERE product_id = ?')
+    .bind(id)
+    .all();
+  
+  return c.json({
+    id: result.id,
+    title: result.title,
+    description: result.description,
+    price: result.price,
+    currency: result.currency,
+    images: JSON.parse(result.images || '[]'),
+    categoryId: result.category_id,
+    status: result.status,
+    variants: (variants.results || []).map((v: any) => ({
+      id: v.id,
+      sku: v.sku,
+      title: v.title,
+      price: v.price,
+      stock: v.stock
+    })),
+    createdAt: result.created_at,
+    updatedAt: result.updated_at
+  });
 });
 
-// Create product (admin)
+// Create product
 const createProductSchema = z.object({
   title: z.string().min(1),
   description: z.string().optional(),
-  price: z.number().int().positive(),
-  categoryId: z.string().optional()
+  price: z.number().int().positive()
 });
 
-catalogRoutes.post('/products', zValidator('json', createProductSchema), requireAuth('admin'), async (c) => {
+catalogRoutes.post('/products', zValidator('json', createProductSchema), async (c) => {
+  await ensureDb(c);
+  
   const data = c.req.valid('json');
+  const id = generateId();
+  const now = Date.now();
+  const sku = generateSku(id);
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const product = await doStub.createProduct(data);
+  await c.env.DB
+    .prepare(`INSERT INTO products (id, title, description, price, currency, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'UAH', 'active', ?, ?)`)
+    .bind(id, data.title, data.description || '', data.price, now, now)
+    .run();
   
   // Create default variant
-  await doStub.createVariant(product!.id, {
-    sku: product!.id.substring(0, 8).toUpperCase(),
-    title: 'Default',
-    price: data.price,
-    stock: 0
-  });
+  const variantId = generateId();
+  await c.env.DB
+    .prepare(`INSERT INTO variants (id, product_id, sku, title, price, stock, created_at, updated_at) VALUES (?, ?, ?, 'Default', ?, 10, ?, ?)`)
+    .bind(variantId, id, sku, data.price, now, now)
+    .run();
   
-  return c.json(product, 201);
+  return c.json({
+    id,
+    title: data.title,
+    description: data.description || '',
+    price: data.price,
+    currency: 'UAH',
+    status: 'active',
+    variants: [{ id: variantId, sku, title: 'Default', price: data.price, stock: 10 }]
+  }, 201);
 });
 
-// Update product (admin)
+// Update product
 const updateProductSchema = z.object({
   title: z.string().min(1).optional(),
   description: z.string().optional(),
   price: z.number().int().positive().optional(),
-  categoryId: z.string().nullable().optional(),
-  status: z.enum(['draft', 'active', 'archived']).optional(),
-  images: z.array(z.string()).optional()
+  status: z.enum(['draft', 'active', 'archived']).optional()
 });
 
-catalogRoutes.patch('/products/:id', zValidator('json', updateProductSchema), requireAuth('admin'), async (c) => {
+catalogRoutes.patch('/products/:id', zValidator('json', updateProductSchema), async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   const data = c.req.valid('json');
+  const now = Date.now();
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  const fields: string[] = [];
+  const values: any[] = [];
   
-  const product = await doStub.updateProduct(id, data);
+  if (data.title) { fields.push('title = ?'); values.push(data.title); }
+  if (data.description !== undefined) { fields.push('description = ?'); values.push(data.description); }
+  if (data.price) { fields.push('price = ?'); values.push(data.price); }
+  if (data.status) { fields.push('status = ?'); values.push(data.status); }
+  fields.push('updated_at = ?');
+  values.push(now);
+  values.push(id);
   
-  if (!product) {
-    return c.json({ error: 'Product not found' }, 404);
-  }
+  await c.env.DB
+    .prepare(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`)
+    .bind(...values)
+    .run();
   
-  return c.json(product);
+  const result = await c.env.DB
+    .prepare('SELECT * FROM products WHERE id = ?')
+    .bind(id)
+    .first();
+  
+  return c.json(result);
 });
 
-// Delete product (admin)
-catalogRoutes.delete('/products/:id', requireAuth('admin'), async (c) => {
+// Delete product
+catalogRoutes.delete('/products/:id', async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  await doStub.deleteProduct(id);
-  
-  return c.json({ success: true });
-});
-
-// Product Variants
-const createVariantSchema = z.object({
-  sku: z.string().min(1),
-  title: z.string().min(1),
-  price: z.number().int().positive(),
-  compareAtPrice: z.number().int().positive().optional(),
-  stock: z.number().int().nonnegative().default(0),
-  weight: z.number().positive().optional(),
-  options: z.record(z.string()).optional()
-});
-
-catalogRoutes.post('/products/:id/variants', zValidator('json', createVariantSchema), requireAuth('admin'), async (c) => {
-  const productId = c.req.param('id');
-  const data = c.req.valid('json');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const variant = await doStub.createVariant(productId, data);
-  
-  return c.json(variant, 201);
-});
-
-const updateVariantSchema = z.object({
-  sku: z.string().min(1).optional(),
-  title: z.string().min(1).optional(),
-  price: z.number().int().positive().optional(),
-  compareAtPrice: z.number().int().positive().nullable().optional(),
-  stock: z.number().int().nonnegative().optional(),
-  weight: z.number().positive().optional(),
-  options: z.record(z.string()).optional()
-});
-
-catalogRoutes.patch('/products/:productId/variants/:variantId', zValidator('json', updateVariantSchema), requireAuth('admin'), async (c) => {
-  const variantId = c.req.param('variantId');
-  const data = c.req.valid('json');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const variant = await doStub.updateVariant(variantId, data);
-  
-  return c.json(variant);
-});
-
-catalogRoutes.delete('/products/:productId/variants/:variantId', requireAuth('admin'), async (c) => {
-  const variantId = c.req.param('variantId');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  await doStub.deleteVariant(variantId);
+  await c.env.DB.prepare('DELETE FROM variants WHERE product_id = ?').bind(id).run();
+  await c.env.DB.prepare('DELETE FROM products WHERE id = ?').bind(id).run();
   
   return c.json({ success: true });
 });
 
 // Categories
 catalogRoutes.get('/categories', async (c) => {
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  await ensureDb(c);
   
-  const categories = await doStub.getCategories();
+  const result = await c.env.DB
+    .prepare('SELECT * FROM categories ORDER BY sort_order ASC')
+    .all();
   
-  return c.json({ categories });
-});
-
-catalogRoutes.get('/categories/:id', async (c) => {
-  const id = c.req.param('id');
-  
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  const category = await doStub.getCategory(id);
-  
-  if (!category) {
-    return c.json({ error: 'Category not found' }, 404);
-  }
-  
-  return c.json(category);
+  return c.json({
+    categories: (result.results || []).map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      slug: row.slug,
+      description: row.description,
+      order: row.sort_order
+    }))
+  });
 });
 
 const createCategorySchema = z.object({
   name: z.string().min(1),
   slug: z.string().optional(),
-  description: z.string().optional(),
-  parentId: z.string().optional()
+  description: z.string().optional()
 });
 
-catalogRoutes.post('/categories', zValidator('json', createCategorySchema), requireAuth('admin'), async (c) => {
+catalogRoutes.post('/categories', zValidator('json', createCategorySchema), async (c) => {
+  await ensureDb(c);
+  
   const data = c.req.valid('json');
+  const id = generateId();
+  const slug = data.slug || data.name.toLowerCase().replace(/\s+/g, '-');
+  const now = Date.now();
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
+  await c.env.DB
+    .prepare(`INSERT INTO categories (id, name, slug, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(id, data.name, slug, data.description || null, now, now)
+    .run();
   
-  const category = await doStub.createCategory(data);
-  
-  return c.json(category, 201);
+  return c.json({ id, name: data.name, slug, description: data.description }, 201);
 });
 
-catalogRoutes.delete('/categories/:id', requireAuth('admin'), async (c) => {
+catalogRoutes.delete('/categories/:id', async (c) => {
+  await ensureDb(c);
+  
   const id = c.req.param('id');
   
-  const doId = c.env.MERCHANT_DO.idFromName('main');
-  const doStub = c.env.MERCHANT_DO.get(doId);
-  
-  await doStub.deleteCategory(id);
+  await c.env.DB.prepare('UPDATE products SET category_id = NULL WHERE category_id = ?').bind(id).run();
+  await c.env.DB.prepare('DELETE FROM categories WHERE id = ?').bind(id).run();
   
   return c.json({ success: true });
 });

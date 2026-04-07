@@ -1,37 +1,25 @@
 {
   "$schema": "wrangler.toml.schema.json",
-  "name": "fufuni-merchant",
+  "name": "fufuni-api",
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
+  "account_id": "ffe705a75a8f624aafb521c612eaf3f8",
 
-  "durable_objects": {
-    "bindings": [
-      { "name": "MERCHANT_DO", "class_name": "MerchantDO" }
-    ]
-  },
-
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["MerchantDO"] }
-  ],
-
-  "r2_buckets": [
-    { "binding": "IMAGES", "bucket_name": "fufuni-images" }
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fufuni-store",
+      "database_id": "77a122a8-8ab7-4d5a-a3cb-88a7a394a43b"
+    }
   ],
 
   "kv_namespaces": [
-    { "binding": "KV_CACHE", "id": "${KV_CACHE_ID}" }
+    { "binding": "KV_CACHE", "id": "cea44b3d8deb4c86ad53995c2f8afb88" }
   ],
 
   "vars": {
-    "MERCHANT_PK": "",
-    "MERCHANT_SK": "",
     "STORE_NAME": "Fufuni Store",
-    "STORE_URL": "",
-    "IMAGES_URL": "",
-    "CORS_ORIGIN": "*",
-    "API_BASE_URL": "",
-    "STRIPE_PUBLISHABLE_KEY": "",
-    "KV_CACHE_ID": ""
+    "CORS_ORIGIN": "*"
   },
 
   "triggers": {
