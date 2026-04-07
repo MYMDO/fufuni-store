@@ -3,8 +3,8 @@ import { useState, useEffect } from 'preact/hooks';
 
 // Configuration - Update these values
 const CONFIG = {
-  API_URL: 'http://localhost:8787',
-  PUBLIC_KEY: '', // Set your public key here or leave empty for demo mode
+  API_URL: 'https://fufuni-api.p4d-b2q.workers.dev',
+  PUBLIC_KEY: '',
   STORE_NAME: 'Fufuni Store'
 };
 

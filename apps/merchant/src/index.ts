@@ -250,6 +250,30 @@ app.get('/v1/orders/:id', async (c) => {
   }
 });
 
+// Admin Orders
+app.get('/v1/admin/orders', async (c) => {
+  try {
+    const result = await c.env.DB
+      .prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 50')
+      .all();
+    
+    const orders = (result.results || []).map((row: any) => ({
+      id: row.id,
+      number: row.number,
+      status: row.status,
+      items: JSON.parse(row.items as string || '[]'),
+      total: row.total,
+      customer: JSON.parse(row.customer as string || '{}'),
+      createdAt: row.created_at
+    }));
+    
+    return c.json({ orders, total: orders.length });
+  } catch (e: any) {
+    console.error('Admin orders error:', e);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 // Admin
 app.get('/v1/admin/stats', async (c) => {
   try {
